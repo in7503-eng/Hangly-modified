@@ -105,6 +105,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="FirebaseDatabase.net" Version="5.0.0" />
+    <PackageReference Include="Microsoft.Office.Interop.Outlook" Version="15.0.4797.1004" />
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705" />
 
@@ -220,8 +222,7 @@
   </Target>
 
   <!-- A build that updates from a local folder must never be one anybody is given. -->
-  <Target Name="RefuseTestUpdateFeed" BeforeTargets="Build"
-          Condition="'$(HanglyUpdateFeed)' != '' and '$(HanglyAllowTestFeed)' != 'true'">
+  <Target Name="RefuseTestUpdateFeed" BeforeTargets="Build" Condition="'$(HanglyUpdateFeed)' != '' and '$(HanglyAllowTestFeed)' != 'true'">
     <Error Text="HanglyUpdateFeed is set. That is for silent-update tests only; pass -p:HanglyAllowTestFeed=true to confirm this is one." />
   </Target>
 

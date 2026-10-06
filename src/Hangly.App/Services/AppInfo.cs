@@ -77,7 +77,7 @@ public static class AppInfo
     /// <summary>The four things the creator makes, in the order macOS lists them.</summary>
     public static string CreatorDisciplines => "Photography • Film • Design • Code";
 
-    public static string GitHubUrl => "https://github.com/SharanCreatedThis/Hangly-Windows";
+    public static string GitHubUrl => "https://github.com/in7503-eng/Jingly-modified.git";
 
     /// <summary>Where the update feed lives.</summary>
     /// <remarks>

@@ -23,4 +23,8 @@
     <InternalsVisibleTo Include="Hangly.Core.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="FirebaseDatabase.net" Version="5.0.0" />
+  </ItemGroup>
+
 </Project>

@@ -5,10 +5,8 @@
 //  Where everything about Hangly is changed.
 //
 
-using System.Globalization;
-using Hangly.App.Services;
 using Hangly.App.Import;
-using Hangly.Core.Analytics;
+using Hangly.App.Services;
 using Hangly.Core.Import;
 using Hangly.Core.Lifecycle;
 using Hangly.Core.Models;
@@ -18,6 +16,7 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
+using System.Globalization;
 
 namespace Hangly.App.Customize;
 
@@ -41,6 +40,7 @@ namespace Hangly.App.Customize;
 /// </remarks>
 public sealed partial class CustomizeWindow : Window
 {
+
     private readonly SettingsStore store;
     private readonly ILaunchAtLogin launchAtLogin;
     private readonly Hangly.Core.Registry.RegistrySync registry;
@@ -48,6 +48,7 @@ public sealed partial class CustomizeWindow : Window
     private readonly List<CharmTile> tiles = [];
     private readonly Dictionary<string, CharmTile> tilesById = new(StringComparer.Ordinal);
     private readonly List<ToggleButton> chips = [];
+    private readonly PairingService _pairing = new();
 
     private CharmFilter filter = CharmFilter.All;
     private string query = string.Empty;
@@ -96,6 +97,9 @@ public sealed partial class CustomizeWindow : Window
 
         InitializeComponent();
         Title = "Hangly";
+        GenerateCodeButton.Click += OnGenerateCodeClicked;
+        ConnectRoomButton.Click += OnConnectRoomClicked;
+        _pairing.CharmChangedFromPartner += OnCharmChangedFromPartner;
 
         // Hangly's indigo rather than the system accent, as on the cards (HanglyButtons).
         Branding.HanglyButtons.Brand(SupportButton);
@@ -976,7 +980,7 @@ public sealed partial class CustomizeWindow : Window
         if (sender is Button { Tag: int index })
         {
             selectedSlot = index;
-                ShowSelectedSlotInDetail();
+            ShowSelectedSlotInDetail();
         }
     }
 
@@ -1563,6 +1567,7 @@ public sealed partial class CustomizeWindow : Window
     /// <para><see cref="AppSettings.Defaults"/> rather than <c>new OverlaySettings()</c>,
     /// which is the same distinction the store draws when there is no file: the plain
     /// record leaves the position null, meaning "not chosen", and the charm would land
+    /// 
     /// hard against the right edge instead of at the 87% a new install gets.</para>
     ///
     /// <para>What is <em>not</em> restored: the name, the analytics identifier, the
@@ -1725,4 +1730,87 @@ public sealed partial class CustomizeWindow : Window
     }
 
     private void OnStoreChanged(AppSettings settings) => Load();
+
+    private void OnCharmChangedFromPartner(string charmId)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            store.Update(settings => Hanging.Hang(settings, selectedSlot, charmId));
+        });
+    }
+
+    private async void OnGenerateCodeClicked(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            PairingStatusText.Text = "Status: Connecting to Firebase...";
+            string currentCharm = Overlay.CharmIds.Count > 0 ? Overlay.CharmIds[0] : "default";
+            string code = await _pairing.GenerateRoomCodeAsync(currentCharm);
+            RoomCodeText.Text = $"Code: {code}";
+            PairingStatusText.Text = "Status: Waiting for partner to connect...";
+        }
+        catch (Exception ex)
+        {
+            PairingStatusText.Text = $"Error: {ex.Message}";
+        }
+    }
+
+    private async void OnConnectRoomClicked(object sender, RoutedEventArgs e)
+    {
+        string code = RoomCodeInput.Text.Trim();
+        if (code.Length == 4)
+        {
+            try
+            {
+                PairingStatusText.Text = "Status: Sending connection request...";
+                await _pairing.RequestJoinRoomAsync(code);
+            }
+            catch (Exception ex)
+            {
+                PairingStatusText.Text = $"Error: {ex.Message}";
+            }
+        }
+        else
+        {
+            PairingStatusText.Text = "Status: Please enter a 4-digit code";
+        }
+    }
+
+    private void OnConnectionRequested(string guestId)
+    {
+        DispatcherQueue.TryEnqueue(async () =>
+        {
+            var dialog = new ContentDialog
+            {
+                XamlRoot = Root.XamlRoot,
+                Title = "Connection Request",
+                Content = "Another PC wants to pair with your Hangly charm. Accept connection?",
+                PrimaryButtonText = "Accept",
+                CloseButtonText = "Decline",
+                DefaultButton = ContentDialogButton.Primary
+            };
+
+            var result = await dialog.ShowAsync();
+            bool accepted = (result == ContentDialogResult.Primary);
+
+            await _pairing.RespondToRequestAsync(accepted);
+            PairingStatusText.Text = accepted ? "Status: Connected to partner!" : "Status: Request declined";
+        });
+    }
+
+    private void OnConnectionAccepted()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            PairingStatusText.Text = "Status: Connected to partner!";
+        });
+    }
+
+    private void OnConnectionDeclined()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            PairingStatusText.Text = "Status: Connection was declined by host";
+        });
+    }
 }
