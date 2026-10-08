@@ -4,7 +4,10 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch: # Allows 1-click manual trigger from GitHub Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -19,9 +22,22 @@ jobs:
       with:
         dotnet-version: '9.0.x'
 
-    - name: Build & Publish App
+    - name: Find & Publish App
+      shell: pwsh
       run: |
-        dotnet publish Hangly.App -c Release -r win-x64 --self-contained false -o ./publish_output
+        # Automatically find the main .csproj file anywhere in the repo
+        $proj = Get-ChildItem -Recurse -Filter *.csproj | Where-Object { $_.Name -like "*App.csproj" -or $_.Name -like "*Hangly*.csproj" -or $_.Name -like "*Jingly*.csproj" } | Select-Object -First 1
+        if (-not $proj) {
+            $proj = Get-ChildItem -Recurse -Filter *.csproj | Select-Object -First 1
+        }
+        
+        if (-not $proj) {
+            Write-Error "No .csproj project file found in the repository!"
+            exit 1
+        }
+
+        Write-Host "Found and building project: $($proj.FullName)"
+        dotnet publish $proj.FullName -c Release -r win-x64 -p:Platform=x64 --self-contained false -o ./publish_output
 
     - name: Create ZIP
       shell: pwsh
