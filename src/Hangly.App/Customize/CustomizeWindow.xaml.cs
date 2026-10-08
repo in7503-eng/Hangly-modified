@@ -21,26 +21,8 @@ using System.Globalization;
 namespace Hangly.App.Customize;
 
 /// <summary>The settings window.</summary>
-/// <remarks>
-/// <b>It hides rather than closes, and that is not a preference.</b> WinUI ends the
-/// process when its last window closes, and Hangly has no other XAML window — the overlay
-/// is a plain Win32 layered window and the tray is a message-only one. Closing this the
-/// ordinary way took the whole app down with it, charm and tray icon included, which was
-/// watched happening before this was written.
-///
-/// <para>Hiding is also the better behaviour for a tray application: the window keeps its
-/// size, its position and whichever page was open.</para>
-///
-/// <para><b>Every control writes straight through to the store.</b> There is no apply
-/// button and no draft copy, because the rope is on screen behind the window and the
-/// point of moving a slider is watching it move. The store persists and raises, the
-/// overlay listens, and this window listens too so that a change made from the tray shows
-/// up here — guarded by <see cref="isLoading"/>, or setting a control from the store
-/// would write the value it just read straight back.</para>
-/// </remarks>
 public sealed partial class CustomizeWindow : Window
 {
-
     private readonly SettingsStore store;
     private readonly ILaunchAtLogin launchAtLogin;
     private readonly Hangly.Core.Registry.RegistrySync registry;
@@ -57,22 +39,11 @@ public sealed partial class CustomizeWindow : Window
     private bool isClosingForReal;
     private bool isLoading;
 
-    /// <summary>Which charm on the cord a click in the grid replaces.</summary>
     private int selectedSlot;
-
-    /// <summary>The charm the detail panel is describing, if any.</summary>
     private CharmCatalogEntry? detailed;
-
-    /// <summary>The places on the rope, as the reorder strip holds them.</summary>
     private readonly System.Collections.ObjectModel.ObservableCollection<SlotTile> slotTiles = [];
-
-    /// <summary>True while the strip is being rebuilt, so its own events are ignored.</summary>
     private bool isRebuildingSlots;
-
-    /// <summary>True while the size slider is being set from the settings rather than by hand.</summary>
     private bool isLoadingSlotSize;
-
-    /// <summary>The last secret shown, so the next one is a different one.</summary>
     private string? lastSecret;
 
     public CustomizeWindow(
@@ -86,22 +57,38 @@ public sealed partial class CustomizeWindow : Window
         this.registry = registry;
         this.environment = environment;
 
-        // Held for the whole of construction, and dropped by Load's finally.
-        //
-        // Every control here writes straight through to the store, so building them is
-        // indistinguishable from a user moving them unless something says otherwise.
-        // Setting a slider's Minimum coerces its Value, which raises ValueChanged — so
-        // merely opening this window wrote charmSize 0.5, ropeLength 0.5 and opacity 0.2
-        // over whatever the user had. That was watched happening to a real settings file.
         isLoading = true;
 
         InitializeComponent();
         Title = "Hangly";
-        GenerateCodeButton.Click += OnGenerateCodeClicked;
-        ConnectRoomButton.Click += OnConnectRoomClicked;
-        _pairing.CharmChangedFromPartner += OnCharmChangedFromPartner;
 
-        // Hangly's indigo rather than the system accent, as on the cards (HanglyButtons).
+        // =========================================================================
+        // STEP 1: WIRE ALL PAIRING BUTTONS & FIREBASE EVENT LISTENERS
+        // =========================================================================
+        GenerateCodeButton.Click += OnGenerateCodeClicked;
+        CancelCodeButton.Click += OnCancelCodeClicked;
+        ConnectRoomButton.Click += OnConnectRoomClicked;
+        CancelConnectButton.Click += OnCancelConnectClicked;
+        AcceptButton.Click += OnAcceptClicked;
+        DeclineButton.Click += OnDeclineClicked;
+        DisconnectButton.Click += OnDisconnectClicked;
+        TabDisconnectButton.Click += OnDisconnectClicked;
+
+        // Pairing Events
+        _pairing.PairingRequested += OnPairingRequested;
+        _pairing.PairingAccepted += OnPairingAccepted;
+        _pairing.PairingDeclined += OnPairingDeclined;
+        _pairing.Unpaired += OnUnpaired;
+        _pairing.CharmChangedFromPartner += OnCharmChangedFromPartner;
+        _pairing.AutoConnected += OnAutoConnected;
+        _pairing.PartnerPresenceChanged += OnPartnerPresenceChanged;
+
+        // Populate local computer name in Connected Device tab
+        MyDeviceNameText.Text = _pairing.MyDeviceName;
+
+        // Auto-reconnect on startup if previously paired
+        _pairing.TryAutoConnect();
+
         Branding.HanglyButtons.Brand(SupportButton);
         SupportButton.CornerRadius = Branding.HanglyButtons.Corner;
         SupportButton.Height = 44;
@@ -129,17 +116,7 @@ public sealed partial class CustomizeWindow : Window
         };
     }
 
-    /// <summary>Whether this window has closed for real; a closed WinUI window cannot be shown again.</summary>
     public bool IsClosed { get; private set; }
-
-    /// <summary>Opens at a size the charm grid reads well at.</summary>
-    /// <remarks>
-    /// <c>AppWindow.Resize</c> is in physical pixels, not DIPs, so a fixed number opens a
-    /// window half the intended size on a 200% display and a quarter of it at 400%.
-    /// WinUI's own default is a fraction of the desktop, which on a large monitor is a
-    /// settings window the size of a wall.
-    /// </remarks>
-    /// <summary>What the detail panel is showing. Bound from the XAML.</summary>
     public CharmDetail Detail { get; } = new();
 
     private void ResizeToDefault()
@@ -149,25 +126,8 @@ public sealed partial class CustomizeWindow : Window
         FixTheSize();
     }
 
-    /// <summary>Puts the window, at its one size, in the middle of the display the pointer is on.</summary>
-    /// <remarks>
-    /// Called on every open, not just the first: the window hides rather than closes, and
-    /// every Hangly window opens in the middle of the display in use rather than where it
-    /// was left (<see cref="Interop.WindowPlacement.SizeAndCentre"/>).
-    /// </remarks>
     public void CentreForOpening() => Interop.WindowPlacement.SizeAndCentre(this, 1120, 800);
 
-    /// <summary>Takes away resizing and maximising, and leaves everything else.</summary>
-    /// <remarks>
-    /// <b>The layout is designed for one size.</b> Everything on every page is arranged to
-    /// fit the default window without scrolling, and a window that can be dragged to any
-    /// shape is a window where that is true at one shape and false at the rest. Letting
-    /// somebody make it four hundred points wide and then meeting a clipped control is
-    /// worse than not letting them.
-    ///
-    /// <para>Moving, minimising and closing all still work — only the two that change the
-    /// shape are gone.</para>
-    /// </remarks>
     private void FixTheSize()
     {
         if (AppWindow.Presenter is not Microsoft.UI.Windowing.OverlappedPresenter presenter)
@@ -179,7 +139,6 @@ public sealed partial class CustomizeWindow : Window
         presenter.IsMaximizable = false;
     }
 
-    /// <summary>Lets the window close for good, on the way out of the application.</summary>
     public void AllowClose()
     {
         isClosingForReal = true;
@@ -201,19 +160,10 @@ public sealed partial class CustomizeWindow : Window
         sender.Hide();
     }
 
-    /// <summary>
-    /// Ranges in code rather than in the markup. Set as XAML attributes these threw
-    /// XamlParseException on <c>RangeBase.Minimum</c> — a slider's bounds have to be
-    /// consistent at every step of being assigned, and attribute order is the markup
-    /// compiler's business rather than ours. Here the order is stated.
-    /// </summary>
     private void ConfigureSliders()
     {
         foreach ((Slider slider, double low, double high) in ((Slider, double, double)[])
             [(SizeSlider, 0.5, 2.0), (LengthSlider, 0.5, 2.0), (OpacitySlider, 0.2, 1.0),
-
-            // From the top of the screen down to the macOS maximum. Below zero is macOS
-            // tucking the knot under its menu bar, which has no meaning here (PositionPicker).
             (VerticalSlider, 0, Hangly.Core.Models.PositionPicker.MaximumOffsetY)])
         {
             slider.Maximum = high;
@@ -224,21 +174,9 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    /// <summary>
-    /// Builds one tile per charm, once, and never again.
-    /// </summary>
-    /// <remarks>
-    /// Filtering regroups these same objects rather than making new ones. A tile owns a
-    /// decoded <c>BitmapImage</c>, so rebuilding the grid on every keystroke would
-    /// re-decode eighty-one PNGs per letter typed — which is the difference between a
-    /// search box that keeps up and one that stutters.
-    /// </remarks>
     private void BuildCharmGrid()
     {
         RebuildTiles();
-
-        // Anything cached for a charm that is gone -- a deleted import, or a charm an
-        // earlier build had -- goes with it.
         CharmThumbnails.Prune(environment.Charms.All);
 
         slotTiles.CollectionChanged += OnSlotsReordered;
@@ -247,13 +185,6 @@ public sealed partial class CustomizeWindow : Window
         ShowResults();
     }
 
-    /// <summary>
-    /// One tile per charm the app knows about, shipped or imported.
-    /// </summary>
-    /// <remarks>
-    /// Tiles for charms that are already here are kept rather than remade, so importing
-    /// does not re-decode eighty-one thumbnails to add one.
-    /// </remarks>
     private void RebuildTiles()
     {
         tiles.Clear();
@@ -268,8 +199,6 @@ public sealed partial class CustomizeWindow : Window
             tiles.Add(tile);
         }
 
-        // A tile whose charm has been deleted must not linger in the dictionary, or the
-        // next import of the same id would show the old drawing.
         var live = environment.Charms.All.Select(entry => entry.Id).ToHashSet(StringComparer.Ordinal);
         foreach (string stale in tilesById.Keys.Where(id => !live.Contains(id)).ToList())
         {
@@ -277,14 +206,9 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    /// <summary>All, the two saved sets, then every category.</summary>
-    /// <summary>The collection cards, built once from the catalogue's own table.</summary>
     private void BuildCollections()
     {
         var cards = new List<CollectionCard>();
-
-        // Custom comes first when it exists: it is the one collection that is yours, and
-        // it is the one you will be looking for.
         IReadOnlyList<CharmCollection> collections = environment.Charms.All
             .Any(entry => entry.CategoryId == CharmIndex.CustomCategoryId)
             ? [CharmIndex.CustomCollection, .. CharmCatalog.Collections]
@@ -309,7 +233,6 @@ public sealed partial class CustomizeWindow : Window
         Collections.ItemsSource = cards;
     }
 
-    /// <summary>Tapping a collection card filters to it, which is the card's whole job.</summary>
     private void OnCollectionTapped(object sender, TappedRoutedEventArgs args)
     {
         if (sender is not FrameworkElement { DataContext: CollectionCard card })
@@ -358,9 +281,6 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    /// <summary>
-    /// Applies the filter and the query, and regroups what survives.
-    /// </summary>
     private void ShowResults()
     {
         AppSettings settings = store.Settings;
@@ -374,8 +294,6 @@ public sealed partial class CustomizeWindow : Window
         var groups = new List<CharmGroup>();
         if (matches.Count > 0)
         {
-            // Recents are already in the order that matters, so they are not regrouped:
-            // splitting them by pack would throw away the only thing the list says.
             if (filter is CharmFilter.Recently)
             {
                 groups.Add(new CharmGroup(
@@ -400,17 +318,11 @@ public sealed partial class CustomizeWindow : Window
         MarkChosen();
         MarkFavourites();
 
-        // Back to the top whenever the results change. Without this a filter applied
-        // while scrolled down lands you in the middle of a different list, and the first
-        // row of collection cards arrives already half out of view.
         ResultsScroller.ChangeView(null, 0, null, disableAnimation: true);
     }
 
-    /// <summary>Which nothing this is, because they are not the same nothing.</summary>
     private void ShowEmptyState(bool isEmpty)
     {
-        // Ropes are showing, so neither of these is. Without this guard every settings
-        // change drew the charm results underneath the rope list; see ApplyBrowseMode.
         if (IsShowingRopes)
         {
             EmptyState.Visibility = Visibility.Collapsed;
@@ -460,7 +372,6 @@ public sealed partial class CustomizeWindow : Window
             return;
         }
 
-        // Typing is not a setting. This never touches the store.
         query = sender.Text;
         ShowResults();
     }
@@ -473,7 +384,6 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    /// <summary>Stars a charm, or unstars it: the tile's star and Ctrl+D both come here.</summary>
     private void ToggleFavourite(string id)
     {
         store.Update(settings => settings with
@@ -484,20 +394,12 @@ public sealed partial class CustomizeWindow : Window
         MarkFavourites();
         RefreshDetailState();
 
-        // Starring while looking at the favourites is a removal, and the tile should go.
         if (filter is CharmFilter.Favourite)
         {
             ShowResults();
         }
     }
 
-    /// <summary>Which heading a charm is shown under.</summary>
-    /// <remarks>
-    /// Built-ins are grouped by the pack directory their artwork already sits in. An
-    /// import is not in that folder at all — its file name is an absolute path with no
-    /// forward slashes in it — so asking the path would have filed every imported charm
-    /// under "Classics &amp; Collection", which it did until this was watched happening.
-    /// </remarks>
     private static string PackOf(CharmCatalogEntry entry)
     {
         if (Hangly.Core.Models.CharmId.IsCustom(entry.Id))
@@ -511,7 +413,6 @@ public sealed partial class CustomizeWindow : Window
 
     private void BuildRopeChoices() => BrowseMode.SelectedIndex = 0;
 
-    /// <summary>Fills the rope shelf from the settings: every rope, or only the starred ones.</summary>
     private void RefreshRopes()
     {
         OverlaySettings overlay = Overlay;
@@ -525,7 +426,6 @@ public sealed partial class CustomizeWindow : Window
         RopeList.SelectedItem = items.FirstOrDefault(item => item.Style == overlay.RopeStyle);
         RopeFavouritesEmpty.Visibility = onlyFavourites && items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
-        // The pane shows the rope in use, large, as it shows the charm in charm mode.
         Detail.ShowRope(RopeStyleTable.DisplayNameOf(overlay.RopeStyle), items.FirstOrDefault(item => item.Style == overlay.RopeStyle)?.Swatch
             ?? (RopeSwatches.PathFor(overlay.RopeStyle) is string path ? new Microsoft.UI.Xaml.Media.Imaging.BitmapImage(new Uri(path)) : null));
     }
@@ -538,7 +438,6 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    /// <summary>The star on a rope card. A Library write, like starring a charm.</summary>
     private void OnRopeFavouriteClicked(object sender, RoutedEventArgs args)
     {
         if ((sender as FrameworkElement)?.Tag is RopeStyle style)
@@ -547,35 +446,10 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    /// <summary>
-    /// Swaps the browse area between charms and ropes.
-    /// </summary>
-    /// <remarks>
-    /// The two share the space rather than sitting side by side, because they are
-    /// alternatives: nobody is choosing a rope and a charm in the same glance. Everything
-    /// that only applies to charms — the search box, the collection chips, importing —
-    /// goes with them.
-    /// </remarks>
     private void OnBrowseModeChanged(object sender, SelectionChangedEventArgs args) => ApplyBrowseMode();
 
-    /// <summary>Whether the browse area is showing ropes rather than charms.</summary>
     private bool IsShowingRopes => BrowseMode.SelectedIndex == 1;
 
-    /// <summary>
-    /// The one place that decides what the browse area is showing.
-    /// </summary>
-    /// <remarks>
-    /// <b>There were two, and they disagreed.</b> Switching to Ropes collapsed the charm
-    /// results here, and <see cref="ShowEmptyState"/> set them visible again — and that
-    /// runs on every settings change, because the store raises and this window reloads. So
-    /// switching to Ropes and then changing the number of charms on the cord put both
-    /// views in the same grid cell at once, with rope names drawn through collection
-    /// cards. Reported as "the tabs overlap", and it was.
-    ///
-    /// <para>Visibility is a function of the mode now, and the mode is asked rather than
-    /// remembered. <see cref="ShowEmptyState"/> only chooses between the results and the
-    /// empty state, and only while charms are the thing being shown.</para>
-    /// </remarks>
     private void ApplyBrowseMode()
     {
         bool ropes = IsShowingRopes;
@@ -596,8 +470,6 @@ public sealed partial class CustomizeWindow : Window
         ShowResults();
     }
 
-    /// <summary>Choosing a rope from the Library, the one page that offers it; the tray's
-    /// Rope menu goes through the same one write path.</summary>
     private void OnRopeListClicked(object sender, ItemClickEventArgs args)
     {
         if (args.ClickedItem is not RopeChoiceItem item || item.Style == Overlay.RopeStyle)
@@ -608,12 +480,8 @@ public sealed partial class CustomizeWindow : Window
         store.UpdateOverlay(overlay => overlay with { RopeStyle = item.Style });
     }
 
-    private void BuildAnchorChoices()
-    {
-        // Nothing to build: where the charm hangs is a slider now.
-    }
+    private void BuildAnchorChoices() { }
 
-    /// <summary>Puts every control where the stored settings say it should be.</summary>
     private void Load()
     {
         isLoading = true;
@@ -676,11 +544,6 @@ public sealed partial class CustomizeWindow : Window
 
     private void OnNameCommitted(object sender, RoutedEventArgs args) => CommitName();
 
-    /// <summary>Saves a changed nickname. The installation registry notices and sends it.</summary>
-    /// <remarks>
-    /// An empty box puts the old name back rather than saving nothing: the name is required
-    /// everywhere else, and clearing it here would be a way round that.
-    /// </remarks>
     private void CommitName()
     {
         if (isLoading)
@@ -706,18 +569,12 @@ public sealed partial class CustomizeWindow : Window
         OpacityLabel.Text = $"Opacity — {OpacitySlider.Value:P0}";
     }
 
-    /// <summary>One button per charm on the cord; clicking one says which a pick replaces.</summary>
     private void RebuildSlots()
     {
         CharmStackState stack = Overlay.Stack;
         IReadOnlyList<RopeCharm> places = stack.Places;
         selectedSlot = Math.Clamp(selectedSlot, 0, places.Count - 1);
 
-        // Rebuilt wholesale rather than edited in place. The strip is at most three
-        // tiles, and the alternative is keeping a collection in step with a settings
-        // document that other surfaces also write to.
-        // An observable collection, not a list: a ListView will not reorder an items
-        // source it cannot write back to, which is why dragging did nothing at first.
         isRebuildingSlots = true;
         slotTiles.Clear();
         for (int index = 0; index < places.Count; index++)
@@ -743,18 +600,6 @@ public sealed partial class CustomizeWindow : Window
             : $"{places.Count} charms hang on the cord, from the top down.";
     }
 
-    /// <summary>The shared shortcut table (<see cref="Hangly.Core.Lifecycle.HanglyShortcut"/>), bound to this window.</summary>
-    /// <remarks>
-    /// On the navigation view, which is the root of the window, so they work wherever the
-    /// keyboard is — except that a text box keeps its own Ctrl+D and Ctrl+F. Decision B1:
-    /// nothing global.
-    ///
-    /// <para>Alt+Up and Alt+Down are not accelerators. A list with focus — the navigation
-    /// on the left, the cord's places — takes Alt+Down as Down and moves its own focus before
-    /// an accelerator is looked for, so the move only worked from some places in the window.
-    /// They are caught on the way down instead (<see cref="OnMoveKeys"/>), and the buttons'
-    /// tooltips name them.</para>
-    /// </remarks>
     private void BuildShortcuts()
     {
         void Bind(Windows.System.VirtualKey key, Windows.System.VirtualKeyModifiers modifiers, Action action)
@@ -788,7 +633,6 @@ public sealed partial class CustomizeWindow : Window
         ToolTipService.SetToolTip(MoveDownButton, $"Move down ({HanglyShortcuts.WindowsKeysOf(HanglyShortcut.MoveDown)})");
     }
 
-    /// <summary>Alt+Up / Alt+Down: the chosen place up or down the cord, from anywhere on the Library page.</summary>
     private void OnMoveKeys(object sender, KeyRoutedEventArgs args)
     {
         if (args.Key is not (Windows.System.VirtualKey.Up or Windows.System.VirtualKey.Down)
@@ -800,7 +644,6 @@ public sealed partial class CustomizeWindow : Window
             return;
         }
 
-        // A text box keeps Alt+Down: in the search box it opens the suggestions.
         if (FocusManager.GetFocusedElement(Content.XamlRoot) is TextBox)
         {
             return;
@@ -820,7 +663,6 @@ public sealed partial class CustomizeWindow : Window
                 .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
     }
 
-    /// <summary>Ctrl+D: the charm or rope the Library is showing, starred or unstarred.</summary>
     private void FavouriteSelection()
     {
         if (CharmsPage.Visibility != Visibility.Visible)
@@ -835,8 +677,6 @@ public sealed partial class CustomizeWindow : Window
             return;
         }
 
-        // The charm the pane shows, which is not always one that was clicked: opening the
-        // Library, or choosing a place on the cord, shows that place's charm.
         if (detailed is not null)
         {
             ToggleFavourite(detailed.Id);
@@ -844,10 +684,8 @@ public sealed partial class CustomizeWindow : Window
     }
 
     private void OnMoveSlotUp(object sender, RoutedEventArgs args) => MoveSlot(-1);
-
     private void OnMoveSlotDown(object sender, RoutedEventArgs args) => MoveSlot(1);
 
-    /// <summary>Moves the chosen place along the cord, and follows it with the selection.</summary>
     private void MoveSlot(int delta)
     {
         CharmStackState stack = Overlay.Stack;
@@ -860,14 +698,10 @@ public sealed partial class CustomizeWindow : Window
         int source = selectedSlot;
         store.UpdateOverlay(overlay => overlay.WithStack(overlay.Stack.Moved(source, destination)));
 
-        // The selection follows the charm rather than staying where the charm was: the
-        // person is moving a thing, not a slot, and having the panel jump to a different
-        // charm mid-move reads as the app losing track.
         selectedSlot = destination;
         RebuildSlots();
     }
 
-    /// <summary>Puts the size slider on the chosen place.</summary>
     private void ShowSlotSize()
     {
         CharmStackState stack = Overlay.Stack;
@@ -893,7 +727,6 @@ public sealed partial class CustomizeWindow : Window
         ShowSlotSize();
     }
 
-    /// <summary>Clicking a tile chooses the place a pick replaces, as the buttons did.</summary>
     private void OnSlotItemClicked(object sender, ItemClickEventArgs args)
     {
         if (args.ClickedItem is SlotTile tile)
@@ -905,17 +738,6 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    /// <summary>The strip's order changed: the strip's order is the rope's order.</summary>
-    /// <remarks>
-    /// Hooked to the collection rather than to <c>DragItemsCompleted</c>, and that is the
-    /// difference between reordering working one way and working every way. A ListView
-    /// reorders its own items source, so this fires whether the move came from a drag or
-    /// from the keyboard — and keyboard reordering is the accessible path, which a
-    /// drag-only handler would have left broken.
-    ///
-    /// <para>Each tile still carries the index it had when the strip was built, so the
-    /// collection's new order <em>is</em> the permutation to apply to the stack.</para>
-    /// </remarks>
     private void OnSlotsReordered(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs args)
     {
         if (args.Action != System.Collections.Specialized.NotifyCollectionChangedAction.Move)
@@ -950,7 +772,6 @@ public sealed partial class CustomizeWindow : Window
         RebuildSlots();
     }
 
-
     private void MarkChosen()
     {
         var chosen = Overlay.CharmIds.ToHashSet(StringComparer.Ordinal);
@@ -960,12 +781,6 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    /// <summary>Points the panel at whatever the chosen slot is carrying.</summary>
-    /// <remarks>
-    /// Which is what makes the panel open describing something rather than empty, and
-    /// what keeps it honest when the slot changes under it — the panel reports the
-    /// selection, so the selection has to reach it from every place it can move.
-    /// </remarks>
     private void ShowSelectedSlotInDetail()
     {
         IReadOnlyList<string> ids = Overlay.CharmIds;
@@ -999,14 +814,15 @@ public sealed partial class CustomizeWindow : Window
             StudioPane.Resume();
         }
         AppearancePage.Visibility = page == "appearance" ? Visibility.Visible : Visibility.Collapsed;
+        DevicesPage.Visibility = page == "devices" ? Visibility.Visible : Visibility.Collapsed;
         AboutPage.Visibility = page == "about" ? Visibility.Visible : Visibility.Collapsed;
 
-        // The cord and the charm's story belong to the Library and nowhere else. They sit
-        // in the navigation pane, which every page shares, so they followed somebody onto
-        // Create, Appearance and About and sat there describing a charm that page had
-        // nothing to do with. Hidden with the page they belong to, which also gives the
-        // other three the full width.
         DetailPanel.Visibility = page == "charms" ? Visibility.Visible : Visibility.Collapsed;
+
+        if (page == "devices")
+        {
+            UpdateDevicesPageUI();
+        }
 
         if (page == "about")
         {
@@ -1014,16 +830,8 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    // --- Updates ------------------------------------------------------------------
-
     private Services.Updater updater => environment.Updates;
 
-    /// <summary>Shows the welcome card again, from the beginning.</summary>
-    /// <remarks>
-    /// The name is already known, so the card opens on its second step — the part that
-    /// says what Hangly is and where it lives. Asking somebody to retype a name they gave
-    /// once would be a strange way to answer "how do I get back to that screen".
-    /// </remarks>
     private void OnShowWelcomeClicked(object sender, RoutedEventArgs args) =>
         environment.ShowWelcomeAgain();
 
@@ -1036,7 +844,6 @@ public sealed partial class CustomizeWindow : Window
         CheckUpdateButton.IsEnabled = true;
     }
 
-    /// <summary>Puts the result of a check on the About page.</summary>
     private void ShowUpdateResult(Services.UpdateCheck result)
     {
         UpdateMessage.Text = result.Message;
@@ -1046,38 +853,15 @@ public sealed partial class CustomizeWindow : Window
         UpdateNotesPanel.Visibility = UpdateNotes.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    /// <summary>
-    /// Opens the About page showing an update the quiet background check already found.
-    /// </summary>
-    /// <remarks>
-    /// The tray line and this page have to agree, so the result found at launch is handed
-    /// over rather than fetched again: a second check moments later could answer
-    /// differently if a release were being published at that exact moment, and the one
-    /// thing worse than no news is two versions of it.
-    /// </remarks>
     public void ShowUpdates(Services.UpdateCheck found)
     {
         ShowSection("about");
         ShowUpdateResult(found);
     }
 
-    /// <summary>Puts the window on the Library, wherever it was left.</summary>
-    /// <remarks>
-    /// The window is built once and hidden on close, so it comes back showing whatever
-    /// page was open when it was dismissed. That is right for the title-bar X and wrong
-    /// for a menu entry that names a page: somebody who last read About and then picked
-    /// Library off the tray menu got About again, and reasonably called it a bug.
-    /// </remarks>
     public void ShowLibrary() => ShowSection("charms");
-
-    /// <summary>Opens a section by its tag: charms, create, appearance or about.</summary>
     public void ShowSectionNamed(string tag) => ShowSection(tag);
 
-    /// <summary>Opens the Library where a notification pointed: one collection, or one charm in the detail panel.</summary>
-    /// <remarks>
-    /// The search is cleared, so what was pointed at is what is seen. A charm is described, not hung: reading about a
-    /// charm is not choosing it. macOS's <c>CharmLibraryViewModel.follow</c>.
-    /// </remarks>
     public void ShowFromNotification(string? collectionId, string? charmId)
     {
         ShowSection("charms");
@@ -1093,14 +877,6 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    /// <summary>Selects the navigation item carrying <paramref name="tag"/>.</summary>
-    /// <remarks>
-    /// Selecting the item is what runs <see cref="OnSectionChanged"/>, which owns page
-    /// visibility. Setting the pages directly here would leave the pane highlighting one
-    /// page while another was on screen. When the wanted item is already selected the
-    /// selection does not change and no event is raised, so the pages are reconciled
-    /// directly in that case.
-    /// </remarks>
     private void ShowSection(string tag)
     {
         foreach (object item in Nav.MenuItems)
@@ -1128,21 +904,13 @@ public sealed partial class CustomizeWindow : Window
         InstallUpdateButton.IsEnabled = false;
         UpdateMessage.Text = "Downloading…";
 
-        // If this succeeds the process is replaced and nothing after it runs. If it
-        // fails, the installed copy is untouched and the message says so. Progress arrives
-        // from the download's thread, so it is handed to this window's own.
         Microsoft.UI.Dispatching.DispatcherQueue queue = DispatcherQueue;
         UpdateMessage.Text = await updater.DownloadAndApplyAsync(status => queue.TryEnqueue(() => UpdateMessage.Text = status));
         InstallUpdateButton.IsEnabled = true;
         UpdateNotesPanel.Visibility = Visibility.Collapsed;
     }
 
-    // --- Create -------------------------------------------------------------------
-
-    /// <summary>Creator Studio's state, kept for the life of the window as macOS keeps it.</summary>
     private Studio.StudioSession? studio;
-
-    /// <summary>The place a drop on the rope came from, which Save fills; null for the Library's choice.</summary>
     private int? studioSlot;
 
     private void BuildStudio()
@@ -1163,8 +931,6 @@ public sealed partial class CustomizeWindow : Window
         };
         AppWindow.Changed += (_, change) =>
         {
-            // Hidden is closed, as far as the model is concerned: 170 MB is only held while
-            // somebody could be using it.
             if (change.DidVisibilityChange && !AppWindow.IsVisible)
             {
                 StudioPane.Release();
@@ -1172,8 +938,6 @@ public sealed partial class CustomizeWindow : Window
         };
     }
 
-    /// <summary>Opens a picture in Creator Studio: a drop on the rope, the tray, or a paste.</summary>
-    /// <param name="slot">The place on the rope the drop landed on, which Save fills.</param>
     public void OpenInStudio(string path, int? slot)
     {
         studioSlot = slot;
@@ -1181,13 +945,6 @@ public sealed partial class CustomizeWindow : Window
         _ = StudioPane.OpenAsync(path);
     }
 
-    /// <summary>Stores a Studio draft through the same store every import uses, and hangs it if asked.</summary>
-    /// <remarks>
-    /// On the UI thread: the settings write raises the store's change, which updates this
-    /// window's controls, and those belong to this thread. Hanging replaces
-    /// a place rather than adding one, exactly as a drop or a pick from the grid does: the
-    /// place a drop came from, otherwise the one chosen on the Library page.
-    /// </remarks>
     private string SaveFromStudio(string markup, StudioDraft draft, string name, bool hang)
     {
         CustomCharmEntry entry = environment.CustomCharmsStore.Add(
@@ -1197,8 +954,6 @@ public sealed partial class CustomizeWindow : Window
             draft.Palette);
         environment.CharmsChanged();
 
-        // The Library first: the settings write below refreshes it, and that refresh looks
-        // the new charm's tile up, so the tile has to exist before the write.
         RebuildTiles();
         BuildCollections();
         BuildFilterChips();
@@ -1206,8 +961,6 @@ public sealed partial class CustomizeWindow : Window
 
         string id = CharmId.ForCustom(entry.Id);
         int slot = studioSlot ?? selectedSlot;
-        // Hung through Hanging like every other way onto the rope. Saved without hanging,
-        // it is in the Library but has not been hung, so it is not "Recently hung" yet.
         if (hang)
         {
             store.Update(settings => Hanging.Hang(settings, slot, id));
@@ -1216,11 +969,8 @@ public sealed partial class CustomizeWindow : Window
         return entry.Name;
     }
 
-    /// <summary>The parts of About that never change while the window is open.</summary>
     private void BuildAbout()
     {
-        // The same icon the executable carries, so there is one image and not two that
-        // could drift. Extracted to a file once because XAML loads images by URI.
         string? icon = AppIconImage.Path();
         if (icon is not null)
         {
@@ -1240,15 +990,8 @@ public sealed partial class CustomizeWindow : Window
         ShowMilestones();
     }
 
-    /// <summary>The four numbers the About page keeps.</summary>
-    /// <remarks>
-    /// The shared statistics model, the same four on macOS in the same order: Launches,
-    /// Charms hung (every hang that changed a place, through <c>Hanging</c>), Swings
-    /// survived (<c>SwingCounter</c>: crossings of the vertical) and Secrets found.
-    /// </remarks>
     private void ShowMilestones()
     {
-        // Up to the moment: whatever the overlay has counted since it last saved.
         environment.BankSwings();
 
         MilestoneSettings milestones = store.Settings.Milestones;
@@ -1258,7 +1001,6 @@ public sealed partial class CustomizeWindow : Window
         StatSecrets.Text = milestones.SecretsFound.ToString("N0", CultureInfo.CurrentCulture);
     }
 
-    /// <summary>Hands out a secret, and pushes the rope as macOS says it does.</summary>
     private void OnSecretClicked(object sender, RoutedEventArgs args)
     {
         string secret = SecretVault.Reveal(Random.Shared, lastSecret);
@@ -1280,12 +1022,6 @@ public sealed partial class CustomizeWindow : Window
     private void OnSuggestClicked(object sender, RoutedEventArgs args) =>
         _ = Windows.System.Launcher.LaunchUriAsync(new Uri(AppInfo.SuggestMailUrl));
 
-    /// <summary>What the installation registry holds for this machine, for whoever wants to check.</summary>
-    /// <remarks>
-    /// macOS's <c>InstallationPanel</c>. In the app rather than behind a developer flag because the argument for
-    /// registering anything at all is that it can be inspected. The installation ID is masked: enough to tell two
-    /// machines apart, not worth writing down.
-    /// </remarks>
     private void LoadInstallation()
     {
         Hangly.Core.Registry.InstallationRecord? record = registry.Store.Record;
@@ -1304,7 +1040,6 @@ public sealed partial class CustomizeWindow : Window
             + "architecture, firstSeen, lastSeen, activeDays, retentionDays, crash reports";
     }
 
-    /// <summary>Appearance → Privacy → View privacy details: About's Installation panel, opened.</summary>
     private void OnPrivacyDetails(object sender, RoutedEventArgs args)
     {
         ShowSection("about");
@@ -1325,8 +1060,6 @@ public sealed partial class CustomizeWindow : Window
         }
         catch (Exception exception)
         {
-            // A dialog that cannot open must not take the window with it: this is the
-            // one handler reached from a button that does nothing else.
             Diagnostics.Failure("support sheet", exception);
         }
     }
@@ -1341,11 +1074,10 @@ public sealed partial class CustomizeWindow : Window
         UpdateDeleteButton(tile.Id);
         ShowDetail(tile.Entry);
 
-        // One act, one write: the rope, Recent and "Charms hung" together (Hanging).
         store.Update(settings => Hanging.Hang(settings, selectedSlot, tile.Id));
+        _ = _pairing.SendCharmUpdateAsync(tile.Id);
     }
 
-    /// <summary>Points the detail panel at a charm, and remembers which one.</summary>
     private void ShowDetail(CharmCatalogEntry? entry)
     {
         detailed = entry;
@@ -1353,7 +1085,6 @@ public sealed partial class CustomizeWindow : Window
         RefreshDetailState();
     }
 
-    /// <summary>Re-reads the two states the panel reports but does not own.</summary>
     private void RefreshDetailState()
     {
         if (detailed is null)
@@ -1373,20 +1104,10 @@ public sealed partial class CustomizeWindow : Window
             return;
         }
 
-        // Nothing is discarded. The stack keeps three places whether or not they all
-        // hang, so turning the count down hides places from the top and turning it back
-        // up brings back exactly what was hidden — which is what macOS does, and what
-        // this used to get wrong by duplicating the bottom charm on the way up.
         int wanted = CountChoice.SelectedIndex + 1;
         store.UpdateOverlay(overlay => overlay.WithStack(overlay.Stack.WithCount(wanted)));
     }
 
-    /// <summary>Moves the charm along the top of the display, live.</summary>
-    /// <remarks>
-    /// Written straight through on every step, like every other control here, because the
-    /// charm is on screen behind this window and watching it move is the point of dragging
-    /// the slider.
-    /// </remarks>
     private void OnPositionChanged(object sender, RangeBaseValueChangedEventArgs args)
     {
         ShowPositionLabel();
@@ -1422,7 +1143,6 @@ public sealed partial class CustomizeWindow : Window
         store.UpdateOverlay(overlay => overlay with { OffsetY = Math.Round(args.NewValue) });
     }
 
-    /// <summary>Back to where a new install hangs it.</summary>
     private void OnResetPosition(object sender, RoutedEventArgs args)
     {
         OverlaySettings fresh = AppSettings.Defaults.Overlay;
@@ -1551,33 +1271,13 @@ public sealed partial class CustomizeWindow : Window
             return;
         }
 
-        // The registry is the truth here, so it is written first and the document records
-        // what the system actually ended up saying.
         launchAtLogin.SetEnabled(LoginToggle.IsOn);
         store.Update(settings => settings with { LaunchAtLogin = launchAtLogin.IsEnabled });
     }
 
-    /// <summary>Puts the rope back to exactly what a new install hangs.</summary>
-    /// <remarks>
-    /// <b>The charms go back too.</b> This used to keep them — macOS's confirmation says
-    /// cord, size and position go back and your charms stay — but a button called
-    /// "Restore defaults" that leaves three charms on the cord has not restored the
-    /// defaults, and that is what it was asked to do.
-    ///
-    /// <para><see cref="AppSettings.Defaults"/> rather than <c>new OverlaySettings()</c>,
-    /// which is the same distinction the store draws when there is no file: the plain
-    /// record leaves the position null, meaning "not chosen", and the charm would land
-    /// 
-    /// hard against the right edge instead of at the 87% a new install gets.</para>
-    ///
-    /// <para>What is <em>not</em> restored: the name, the analytics identifier, the
-    /// milestones, the favourites and the recents. None of those is a default anybody is
-    /// asking to go back to, and two of them cannot be recovered once discarded.</para>
-    /// </remarks>
     private void OnReset(object sender, RoutedEventArgs args) =>
         store.UpdateOverlay(_ => AppSettings.Defaults.Overlay);
 
-    /// <summary>Only an imported charm can be deleted, so the button only appears for one.</summary>
     private void UpdateDeleteButton(string charmId)
     {
         selectedCharmId = charmId;
@@ -1620,20 +1320,14 @@ public sealed partial class CustomizeWindow : Window
             return;
         }
 
-        // Shown straight away, without a restart: the tiles are rebuilt, the chips get
-        // "Yours" if this was the first one, and the new charm goes on the cord.
         RebuildTiles();
         RebuildChips();
         filter = CharmFilter.Category(Hangly.Core.Models.CharmIndex.CustomCategoryId);
         HighlightChips();
         UpdateDeleteButton(outcome.Entry.CharmId);
 
-        // The chips scroll, and "Yours" is at the far end of them — so the one chip that
-        // just became relevant is the one that would be off the edge.
         chips.LastOrDefault()?.StartBringIntoView();
 
-        // Through Hanging like every other way onto the rope, which also keeps the place's
-        // size — writing the id list directly used to drop it.
         store.Update(settings => Hanging.Hang(settings, selectedSlot, outcome.Entry.CharmId));
 
         ShowResults();
@@ -1663,11 +1357,6 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    /// <summary>Deletes one of the user's own charms once they say so; a built-in is ignored.</summary>
-    /// <remarks>
-    /// Asked first, as macOS does: the toolbar button used to delete on the click, and the
-    /// image goes with the charm, so there is nothing to get it back from.
-    /// </remarks>
     private async Task ConfirmAndDeleteAsync(string id)
     {
         if (!Hangly.Core.Models.CharmId.IsCustom(id))
@@ -1678,7 +1367,6 @@ public sealed partial class CustomizeWindow : Window
         CustomCharmEntry? entry = environment.CustomCharms.Entries
             .FirstOrDefault(candidate => candidate.CharmId == id);
 
-        // One ContentDialog per window at a time; a second ShowAsync throws (see SupportSheet).
         if (entry is null || Microsoft.UI.Xaml.Media.VisualTreeHelper.GetOpenPopupsForXamlRoot(Root.XamlRoot).Any(popup => popup.Child is ContentDialog))
         {
             return;
@@ -1721,7 +1409,6 @@ public sealed partial class CustomizeWindow : Window
         ShowResults();
     }
 
-    /// <summary>Rebuilds the chips, because "Yours" appears and disappears with the imports.</summary>
     private void RebuildChips()
     {
         chips.Clear();
@@ -1730,6 +1417,129 @@ public sealed partial class CustomizeWindow : Window
     }
 
     private void OnStoreChanged(AppSettings settings) => Load();
+
+    // =========================================================================
+    // STEP 2: PAIRING LOGIC & EVENT HANDLERS
+    // =========================================================================
+
+    private void SetPairedUI(bool isPaired, string roomCode = "")
+    {
+        if (isPaired)
+        {
+            GenerateCodeButton.Visibility = Visibility.Collapsed;
+            CancelCodeButton.Visibility = Visibility.Collapsed;
+            RoomCodeText.Visibility = Visibility.Collapsed;
+            RoomCodeInput.Visibility = Visibility.Collapsed;
+            ConnectRoomButton.Visibility = Visibility.Collapsed;
+            CancelConnectButton.Visibility = Visibility.Collapsed;
+            RequestAlertBox.Visibility = Visibility.Collapsed;
+
+            DisconnectButton.Visibility = Visibility.Visible;
+            PartnerPresencePanel.Visibility = Visibility.Visible;
+            PairingStatusText.Text = $"Status: Paired with {_pairing.PartnerDeviceName ?? "partner"} (Room: {roomCode})";
+
+            // 🟢 Set directly to Green upon connection:
+            PartnerStatusDot.Fill = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 16, 124, 65));
+            PartnerPresenceText.Text = "Partner is Online";
+
+            UpdateDevicesPageUI();
+        }
+        else
+        {
+            GenerateCodeButton.Visibility = Visibility.Visible;
+            GenerateCodeButton.IsEnabled = true;
+            CancelCodeButton.Visibility = Visibility.Visible;
+            CancelCodeButton.IsEnabled = false;
+            RoomCodeText.Visibility = Visibility.Visible;
+            RoomCodeText.Text = "Code: ----";
+            RoomCodeInput.Visibility = Visibility.Visible;
+            RoomCodeInput.Text = "";
+            ConnectRoomButton.Visibility = Visibility.Visible;
+            ConnectRoomButton.IsEnabled = true;
+            CancelConnectButton.Visibility = Visibility.Visible;
+            CancelConnectButton.IsEnabled = false;
+            RequestAlertBox.Visibility = Visibility.Collapsed;
+
+            DisconnectButton.Visibility = Visibility.Collapsed;
+            PartnerPresencePanel.Visibility = Visibility.Visible;
+
+            // ⚪ Set directly to Gray when disconnected:
+            PartnerStatusDot.Fill = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 138, 136, 134));
+            PartnerPresenceText.Text = "Not connected";
+            PairingStatusText.Text = "Status: Not connected";
+
+            UpdateDevicesPageUI();
+        }
+    }
+
+    private void UpdateDevicesPageUI()
+    {
+        MyDeviceNameText.Text = _pairing.MyDeviceName;
+        if (_pairing.IsConnected)
+        {
+            DevicesPairedInfo.Visibility = Visibility.Visible;
+            DevicesNotPairedInfo.Visibility = Visibility.Collapsed;
+            PartnerDeviceNameText.Text = _pairing.PartnerDeviceName ?? "Partner Device";
+            DevicesRoomCodeText.Text = _pairing.CurrentRoomCode ?? "----";
+            DevicesStatusDot.Fill = PartnerStatusDot.Fill;
+            DevicesStatusText.Text = PartnerPresenceText.Text;
+        }
+        else
+        {
+            DevicesPairedInfo.Visibility = Visibility.Collapsed;
+            DevicesNotPairedInfo.Visibility = Visibility.Visible;
+        }
+    }
+
+    private void OnAutoConnected(string roomCode)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            SetPairedUI(true, roomCode);
+        });
+    }
+
+    private async void OnDisconnectClicked(object sender, RoutedEventArgs e)
+    {
+        await _pairing.DisconnectAndUnpairAsync();
+        SetPairedUI(false);
+    }
+
+    private void OnUnpaired()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            SetPairedUI(false);
+        });
+    }
+
+    private void OnPartnerPresenceChanged(bool isOnline)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            UpdatePartnerPresenceUI(isOnline);
+        });
+    }
+
+    private void UpdatePartnerPresenceUI(bool isOnline)
+    {
+        PartnerPresencePanel.Visibility = Visibility.Visible;
+        if (isOnline)
+        {
+            // 🟢 Green dot
+            PartnerStatusDot.Fill = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 16, 124, 65));
+            PartnerPresenceText.Text = "Partner is Online";
+        }
+        else
+        {
+            // ⚪ Gray dot
+            PartnerStatusDot.Fill = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 138, 136, 134));
+            PartnerPresenceText.Text = _pairing.IsConnected ? "Partner is Offline" : "Not connected";
+        }
+
+        DevicesStatusDot.Fill = PartnerStatusDot.Fill;
+        DevicesStatusText.Text = PartnerPresenceText.Text;
+    }
 
     private void OnCharmChangedFromPartner(string charmId)
     {
@@ -1744,10 +1554,37 @@ public sealed partial class CustomizeWindow : Window
         try
         {
             PairingStatusText.Text = "Status: Connecting to Firebase...";
+            GenerateCodeButton.IsEnabled = false;
+
             string currentCharm = Overlay.CharmIds.Count > 0 ? Overlay.CharmIds[0] : "default";
             string code = await _pairing.GenerateRoomCodeAsync(currentCharm);
+
             RoomCodeText.Text = $"Code: {code}";
+            CancelCodeButton.IsEnabled = true;
             PairingStatusText.Text = "Status: Waiting for partner to connect...";
+
+            // 🟡 Orange dot while waiting
+            PartnerStatusDot.Fill = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 247, 99, 12));
+            PartnerPresenceText.Text = "Waiting for partner...";
+        }
+        catch (Exception ex)
+        {
+            GenerateCodeButton.IsEnabled = true;
+            PairingStatusText.Text = $"Error: {ex.Message}";
+        }
+    }
+
+    private async void OnCancelCodeClicked(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            await _pairing.CancelRoomAsync();
+            RoomCodeText.Text = "Code: ----";
+            GenerateCodeButton.IsEnabled = true;
+            CancelCodeButton.IsEnabled = false;
+            RequestAlertBox.Visibility = Visibility.Collapsed;
+            PairingStatusText.Text = "Status: Room cancelled. Not connected";
+            UpdatePartnerPresenceUI(false);
         }
         catch (Exception ex)
         {
@@ -1763,11 +1600,28 @@ public sealed partial class CustomizeWindow : Window
             try
             {
                 PairingStatusText.Text = "Status: Sending connection request...";
-                await _pairing.RequestJoinRoomAsync(code);
+                ConnectRoomButton.IsEnabled = false;
+                CancelConnectButton.IsEnabled = true;
+
+                // 🟡 Orange dot while connecting
+                PartnerStatusDot.Fill = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 247, 99, 12));
+                PartnerPresenceText.Text = "Connecting...";
+
+                bool success = await _pairing.RequestJoinRoomAsync(code);
+                if (!success)
+                {
+                    PairingStatusText.Text = "Status: Room not found. Check code.";
+                    ConnectRoomButton.IsEnabled = true;
+                    CancelConnectButton.IsEnabled = false;
+                    UpdatePartnerPresenceUI(false);
+                }
             }
             catch (Exception ex)
             {
                 PairingStatusText.Text = $"Error: {ex.Message}";
+                ConnectRoomButton.IsEnabled = true;
+                CancelConnectButton.IsEnabled = false;
+                UpdatePartnerPresenceUI(false);
             }
         }
         else
@@ -1776,41 +1630,70 @@ public sealed partial class CustomizeWindow : Window
         }
     }
 
-    private void OnConnectionRequested(string guestId)
+    private async void OnCancelConnectClicked(object sender, RoutedEventArgs e)
     {
-        DispatcherQueue.TryEnqueue(async () =>
+        try
         {
-            var dialog = new ContentDialog
-            {
-                XamlRoot = Root.XamlRoot,
-                Title = "Connection Request",
-                Content = "Another PC wants to pair with your Hangly charm. Accept connection?",
-                PrimaryButtonText = "Accept",
-                CloseButtonText = "Decline",
-                DefaultButton = ContentDialogButton.Primary
-            };
-
-            var result = await dialog.ShowAsync();
-            bool accepted = (result == ContentDialogResult.Primary);
-
-            await _pairing.RespondToRequestAsync(accepted);
-            PairingStatusText.Text = accepted ? "Status: Connected to partner!" : "Status: Request declined";
-        });
+            PairingStatusText.Text = "Status: Cancelling request...";
+            await _pairing.CancelRequestAsync();
+            ConnectRoomButton.IsEnabled = true;
+            CancelConnectButton.IsEnabled = false;
+            PairingStatusText.Text = "Status: Request cancelled. Not connected";
+            UpdatePartnerPresenceUI(false);
+        }
+        catch (Exception ex)
+        {
+            PairingStatusText.Text = $"Error: {ex.Message}";
+        }
     }
 
-    private void OnConnectionAccepted()
+    // Host receives pair request from Guest -> shows inline RequestAlertBox with Guest PC Name
+    private void OnPairingRequested(string guestId, string guestDeviceName)
     {
         DispatcherQueue.TryEnqueue(() =>
         {
-            PairingStatusText.Text = "Status: Connected to partner!";
+            RequestAlertText.Text = string.IsNullOrEmpty(guestDeviceName)
+                ? "Device wants to pair!"
+                : $"{guestDeviceName} wants to pair!";
+            RequestAlertBox.Visibility = Visibility.Visible;
+            PairingStatusText.Text = $"Status: Incoming pair request from {guestDeviceName}!";
         });
     }
 
-    private void OnConnectionDeclined()
+    // Host clicks Accept button in RequestAlertBox
+    private async void OnAcceptClicked(object sender, RoutedEventArgs e)
+    {
+        RequestAlertBox.Visibility = Visibility.Collapsed;
+        await _pairing.RespondToRequestAsync(true);
+        SetPairedUI(true, _pairing.CurrentRoomCode ?? "");
+    }
+
+    // Host clicks Decline button in RequestAlertBox
+    private async void OnDeclineClicked(object sender, RoutedEventArgs e)
+    {
+        RequestAlertBox.Visibility = Visibility.Collapsed;
+        PairingStatusText.Text = "Status: Request declined";
+        await _pairing.RespondToRequestAsync(false);
+    }
+
+    // Guest gets accepted
+    private void OnPairingAccepted()
     {
         DispatcherQueue.TryEnqueue(() =>
         {
+            SetPairedUI(true, _pairing.CurrentRoomCode ?? "");
+        });
+    }
+
+    // Guest gets declined
+    private void OnPairingDeclined()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            ConnectRoomButton.IsEnabled = true;
+            CancelConnectButton.IsEnabled = false;
             PairingStatusText.Text = "Status: Connection was declined by host";
+            UpdatePartnerPresenceUI(false);
         });
     }
 }

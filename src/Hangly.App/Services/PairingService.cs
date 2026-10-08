@@ -1,185 +1,438 @@
 ﻿using System;
 using System.IO;
-using System.Reactive.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
-using Firebase.Database;
-using Firebase.Database.Query;
 
 namespace Hangly.App.Services;
 
 public class PairingService
 {
-    // Your exact Firebase Database URL:
     private const string FirebaseUrl = "https://hangly-57171-default-rtdb.firebaseio.com/";
+    private readonly HttpClient _http = new();
 
-    private readonly FirebaseClient _client;
-    private readonly string _clientId = Guid.NewGuid().ToString();
-    private IDisposable? _subscription;
+    // Unique ID per running instance so testing two apps on one PC works
+    private readonly string _deviceId = Guid.NewGuid().ToString("N")[..8];
 
     public string? CurrentRoomCode { get; private set; }
     public bool IsHost { get; private set; }
+    public bool IsConnected { get; private set; }
+    public bool IsPartnerOnline { get; private set; }
 
+    public string MyDeviceName => Environment.MachineName;
+    public string? PartnerDeviceName { get; private set; }
+
+    public event Action<string, string>? PairingRequested; // (guestId, guestDeviceName)
+    public event Action? PairingAccepted;
+    public event Action? PairingDeclined;
+    public event Action? Unpaired;
     public event Action<string>? CharmChangedFromPartner;
-    public event Action<string>? ConnectionRequested;
-    public event Action? ConnectionAccepted;
-    public event Action? ConnectionDeclined;
+    public event Action<string>? AutoConnected;
+    public event Action<bool>? PartnerPresenceChanged;
 
-    public PairingService()
+    private CancellationTokenSource? _pollCts;
+    private string _lastCharm = string.Empty;
+    private long _lastHeartbeatSent;
+    private long _previousPartnerLastSeen;
+    private long _lastTimePartnerSeenUpdated;
+
+    private static string SaveFilePath =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Hangly", "paired_room.txt");
+
+    public void StopPolling()
     {
-        _client = new FirebaseClient(FirebaseUrl);
+        _pollCts?.Cancel();
+        _pollCts = null;
+    }
 
-        // Safe auto-reconnect from local settings file
-        string? savedCode = LoadSavedCode();
-        if (!string.IsNullOrEmpty(savedCode))
+    public void SavePairedRoom(string roomCode, string role, string partnerDevice)
+    {
+        try
         {
-            CurrentRoomCode = savedCode;
-            ListenToRoom(savedCode);
+            Directory.CreateDirectory(Path.GetDirectoryName(SaveFilePath)!);
+            File.WriteAllText(SaveFilePath, $"{roomCode}|{role}|{partnerDevice}");
         }
+        catch { }
     }
 
-    public async Task<string> GenerateRoomCodeAsync(string initialCharmId)
+    public (string roomCode, string role, string partnerDevice)? LoadSavedPairedRoom()
     {
+        try
+        {
+            if (File.Exists(SaveFilePath))
+            {
+                var content = File.ReadAllText(SaveFilePath).Trim();
+                var parts = content.Split('|');
+                if (parts.Length >= 2 && !string.IsNullOrWhiteSpace(parts[0]))
+                {
+                    string partnerName = parts.Length >= 3 && !string.IsNullOrWhiteSpace(parts[2]) ? parts[2] : "Partner Device";
+                    return (parts[0], parts[1], partnerName);
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    public void ClearSavedPairedRoom()
+    {
+        try
+        {
+            if (File.Exists(SaveFilePath))
+            {
+                File.Delete(SaveFilePath);
+            }
+        }
+        catch { }
+    }
+
+    public void TryAutoConnect()
+    {
+        var saved = LoadSavedPairedRoom();
+        if (saved == null) return;
+
+        var (roomCode, role, partnerDevice) = saved.Value;
+        CurrentRoomCode = roomCode;
+        IsHost = role == "host";
+        PartnerDeviceName = partnerDevice;
+        StartPollingLoop(isAutoConnecting: true);
+    }
+
+    public async Task<string> GenerateRoomCodeAsync(string? currentCharm = null)
+    {
+        StopPolling();
         IsHost = true;
-        string code = Random.Shared.Next(1000, 9999).ToString();
-        CurrentRoomCode = code;
+        IsConnected = false;
+        IsPartnerOnline = false;
+        PartnerDeviceName = null;
+        _previousPartnerLastSeen = 0;
+        _lastTimePartnerSeenUpdated = 0;
+        CurrentRoomCode = Random.Shared.Next(1000, 10000).ToString();
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-        SaveCode(code);
-        ListenToRoom(code);
-
-        await _client.Child("rooms").Child(code).PutAsync(new RoomState
+        var payload = new
         {
-            HostId = _clientId,
-            Status = "waiting",
-            CharmId = initialCharmId,
-            LastSenderId = _clientId
-        });
+            hostId = _deviceId,
+            hostDeviceName = MyDeviceName,
+            status = "waiting",
+            charm = currentCharm ?? "classic",
+            createdAt = now,
+            hostLastSeen = now
+        };
 
-        return code;
+        var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        var res = await _http.PutAsync($"{FirebaseUrl}rooms/{CurrentRoomCode}.json", content);
+        res.EnsureSuccessStatusCode();
+
+        StartPollingLoop(isAutoConnecting: false);
+        return CurrentRoomCode;
     }
 
-    public async Task RequestJoinRoomAsync(string code)
+    public async Task<bool> RequestJoinRoomAsync(string roomCode)
     {
+        StopPolling();
         IsHost = false;
-        CurrentRoomCode = code;
-        ListenToRoom(code);
+        IsConnected = false;
+        IsPartnerOnline = false;
+        PartnerDeviceName = null;
+        _previousPartnerLastSeen = 0;
+        _lastTimePartnerSeenUpdated = 0;
+        CurrentRoomCode = roomCode.Trim();
 
-        await _client.Child("rooms").Child(code).PatchAsync(new
+        var res = await _http.GetAsync($"{FirebaseUrl}rooms/{CurrentRoomCode}.json");
+        if (!res.IsSuccessStatusCode) return false;
+
+        var json = await res.Content.ReadAsStringAsync();
+        if (string.IsNullOrEmpty(json) || json == "null") return false;
+
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        string status = root.TryGetProperty("status", out var s) ? s.GetString() ?? "" : "";
+        string hostDeviceName = root.TryGetProperty("hostDeviceName", out var hdn) ? hdn.GetString() ?? "" : "";
+
+        if (status != "waiting") return false;
+
+        if (!string.IsNullOrEmpty(hostDeviceName))
         {
-            guestId = _clientId,
-            status = "requested"
-        });
+            PartnerDeviceName = hostDeviceName;
+        }
+
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var patch = new
+        {
+            guestId = _deviceId,
+            guestDeviceName = MyDeviceName,
+            status = "requested",
+            guestLastSeen = now
+        };
+
+        var patchContent = new StringContent(JsonSerializer.Serialize(patch), Encoding.UTF8, "application/json");
+        var patchReq = new HttpRequestMessage(new HttpMethod("PATCH"), $"{FirebaseUrl}rooms/{CurrentRoomCode}.json")
+        {
+            Content = patchContent
+        };
+        var patchRes = await _http.SendAsync(patchReq);
+        if (!patchRes.IsSuccessStatusCode) return false;
+
+        StartPollingLoop(isAutoConnecting: false);
+        return true;
     }
 
     public async Task RespondToRequestAsync(bool accept)
     {
         if (string.IsNullOrEmpty(CurrentRoomCode)) return;
 
-        string newStatus = accept ? "accepted" : "declined";
-        await _client.Child("rooms").Child(CurrentRoomCode).PatchAsync(new
+        var patch = new { status = accept ? "connected" : "declined" };
+        var patchContent = new StringContent(JsonSerializer.Serialize(patch), Encoding.UTF8, "application/json");
+        var req = new HttpRequestMessage(new HttpMethod("PATCH"), $"{FirebaseUrl}rooms/{CurrentRoomCode}.json")
         {
-            status = newStatus
-        });
+            Content = patchContent
+        };
+        await _http.SendAsync(req);
+
+        if (accept)
+        {
+            IsConnected = true;
+            IsPartnerOnline = true;
+            _lastTimePartnerSeenUpdated = Environment.TickCount64;
+            SavePairedRoom(CurrentRoomCode, "host", PartnerDeviceName ?? "Partner Device");
+        }
     }
 
-    private void ListenToRoom(string code)
+    public async Task DisconnectAndUnpairAsync()
     {
-        _subscription?.Dispose();
+        StopPolling();
+        ClearSavedPairedRoom();
 
-        _subscription = _client
-            .Child("rooms")
-            .Child(code)
-            .AsObservable<RoomState>()
-            .Subscribe(d =>
+        if (!string.IsNullOrEmpty(CurrentRoomCode))
+        {
+            try
             {
-                if (d.Object == null) return;
-                var room = d.Object;
+                var patch = new { status = "unpaired" };
+                var req = new HttpRequestMessage(new HttpMethod("PATCH"), $"{FirebaseUrl}rooms/{CurrentRoomCode}.json")
+                {
+                    Content = new StringContent(JsonSerializer.Serialize(patch), Encoding.UTF8, "application/json")
+                };
+                await _http.SendAsync(req);
+            }
+            catch { }
+        }
 
-                // 1. Host receives request from Guest
-                if (IsHost && room.Status == "requested" && room.GuestId != _clientId)
-                {
-                    ConnectionRequested?.Invoke(room.GuestId);
-                }
+        CurrentRoomCode = null;
+        IsConnected = false;
+        IsPartnerOnline = false;
+        PartnerDeviceName = null;
+        _previousPartnerLastSeen = 0;
+        _lastTimePartnerSeenUpdated = 0;
+        Unpaired?.Invoke();
+    }
 
-                // 2. Guest receives Host response
-                if (!IsHost && room.Status == "accepted")
-                {
-                    SaveCode(code);
-                    ConnectionAccepted?.Invoke();
-                }
-                else if (!IsHost && room.Status == "declined")
-                {
-                    ConnectionDeclined?.Invoke();
-                }
+    public async Task CancelRoomAsync()
+    {
+        StopPolling();
+        if (!string.IsNullOrEmpty(CurrentRoomCode))
+        {
+            try
+            {
+                await _http.DeleteAsync($"{FirebaseUrl}rooms/{CurrentRoomCode}.json");
+            }
+            catch { }
+            CurrentRoomCode = null;
+        }
+        IsConnected = false;
+        IsPartnerOnline = false;
+        PartnerDeviceName = null;
+        _previousPartnerLastSeen = 0;
+        _lastTimePartnerSeenUpdated = 0;
+    }
 
-                // 3. Charm synchronization
-                if (room.Status == "accepted" && room.LastSenderId != _clientId && !string.IsNullOrEmpty(room.CharmId))
+    public async Task CancelRequestAsync()
+    {
+        StopPolling();
+        if (!string.IsNullOrEmpty(CurrentRoomCode))
+        {
+            try
+            {
+                var patch = new
                 {
-                    CharmChangedFromPartner?.Invoke(room.CharmId);
-                }
-            });
+                    guestId = "",
+                    guestDeviceName = "",
+                    status = "waiting"
+                };
+                var req = new HttpRequestMessage(new HttpMethod("PATCH"), $"{FirebaseUrl}rooms/{CurrentRoomCode}.json")
+                {
+                    Content = new StringContent(JsonSerializer.Serialize(patch), Encoding.UTF8, "application/json")
+                };
+                await _http.SendAsync(req);
+            }
+            catch { }
+            CurrentRoomCode = null;
+        }
+        IsConnected = false;
+        IsPartnerOnline = false;
+        PartnerDeviceName = null;
+        _previousPartnerLastSeen = 0;
+        _lastTimePartnerSeenUpdated = 0;
     }
 
     public async Task SendCharmUpdateAsync(string charmId)
     {
-        if (string.IsNullOrEmpty(CurrentRoomCode)) return;
+        if (!IsConnected || string.IsNullOrEmpty(CurrentRoomCode)) return;
+        _lastCharm = charmId;
 
-        await _client.Child("rooms").Child(CurrentRoomCode).PatchAsync(new
-        {
-            charmId = charmId,
-            lastSenderId = _clientId
-        });
-    }
-
-    public void Disconnect()
-    {
-        RemoveCode();
-        CurrentRoomCode = null;
-        _subscription?.Dispose();
-    }
-
-    // --- Safe Unpackaged Local File Storage ---
-    private static string GetStorageFilePath()
-    {
-        string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Hangly");
-        Directory.CreateDirectory(dir);
-        return Path.Combine(dir, "pair_code.txt");
-    }
-
-    private static string? LoadSavedCode()
-    {
         try
         {
-            string path = GetStorageFilePath();
-            return File.Exists(path) ? File.ReadAllText(path).Trim() : null;
-        }
-        catch { return null; }
-    }
-
-    private static void SaveCode(string code)
-    {
-        try
-        {
-            File.WriteAllText(GetStorageFilePath(), code);
+            var patch = new { charm = charmId };
+            var req = new HttpRequestMessage(new HttpMethod("PATCH"), $"{FirebaseUrl}rooms/{CurrentRoomCode}.json")
+            {
+                Content = new StringContent(JsonSerializer.Serialize(patch), Encoding.UTF8, "application/json")
+            };
+            await _http.SendAsync(req);
         }
         catch { }
     }
 
-    private static void RemoveCode()
+    private void StartPollingLoop(bool isAutoConnecting)
     {
-        try
-        {
-            string path = GetStorageFilePath();
-            if (File.Exists(path)) File.Delete(path);
-        }
-        catch { }
-    }
-}
+        StopPolling();
+        _pollCts = new CancellationTokenSource();
+        var token = _pollCts.Token;
 
-public class RoomState
-{
-    public string HostId { get; set; } = string.Empty;
-    public string GuestId { get; set; } = string.Empty;
-    public string Status { get; set; } = "waiting";
-    public string CharmId { get; set; } = string.Empty;
-    public string LastSenderId { get; set; } = string.Empty;
+        _ = Task.Run(async () =>
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    if (string.IsNullOrEmpty(CurrentRoomCode)) break;
+
+                    long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+                    // Send heartbeat every 2 seconds if connected or pairing
+                    if (now - _lastHeartbeatSent >= 2)
+                    {
+                        _lastHeartbeatSent = now;
+                        var hbPatch = IsHost ? (object)new { hostLastSeen = now } : (object)new { guestLastSeen = now };
+                        var hbReq = new HttpRequestMessage(new HttpMethod("PATCH"), $"{FirebaseUrl}rooms/{CurrentRoomCode}.json")
+                        {
+                            Content = new StringContent(JsonSerializer.Serialize(hbPatch), Encoding.UTF8, "application/json")
+                        };
+                        _ = await _http.SendAsync(hbReq, token);
+                    }
+
+                    var res = await _http.GetAsync($"{FirebaseUrl}rooms/{CurrentRoomCode}.json", token);
+                    if (res.IsSuccessStatusCode)
+                    {
+                        var json = await res.Content.ReadAsStringAsync(token);
+                        if (!string.IsNullOrEmpty(json) && json != "null")
+                        {
+                            using var doc = JsonDocument.Parse(json);
+                            var root = doc.RootElement;
+
+                            string status = root.TryGetProperty("status", out var s) ? s.GetString() ?? "" : "";
+                            string guestId = root.TryGetProperty("guestId", out var g) ? g.GetString() ?? "" : "";
+                            string charm = root.TryGetProperty("charm", out var c) ? c.GetString() ?? "" : "";
+                            string guestDeviceName = root.TryGetProperty("guestDeviceName", out var gdn) ? gdn.GetString() ?? "" : "";
+                            string hostDeviceName = root.TryGetProperty("hostDeviceName", out var hdn) ? hdn.GetString() ?? "" : "";
+                            long hostLastSeen = root.TryGetProperty("hostLastSeen", out var hls) ? hls.GetInt64() : 0L;
+                            long guestLastSeen = root.TryGetProperty("guestLastSeen", out var gls) ? gls.GetInt64() : 0L;
+
+                            string remotePartnerDevice = IsHost ? guestDeviceName : hostDeviceName;
+                            if (!string.IsNullOrEmpty(remotePartnerDevice))
+                            {
+                                PartnerDeviceName = remotePartnerDevice;
+                            }
+
+                            long partnerLastSeen = IsHost ? guestLastSeen : hostLastSeen;
+
+                            // Handle Host incoming request
+                            if (IsHost && !IsConnected && status == "requested" && !string.IsNullOrEmpty(guestId) && guestId != _deviceId)
+                            {
+                                PartnerDeviceName = guestDeviceName;
+                                PairingRequested?.Invoke(guestId, guestDeviceName);
+                            }
+                            // Handle Guest accepted
+                            else if (!IsHost && !IsConnected && status == "connected")
+                            {
+                                IsConnected = true;
+                                IsPartnerOnline = true;
+                                _lastTimePartnerSeenUpdated = Environment.TickCount64;
+                                SavePairedRoom(CurrentRoomCode, "guest", PartnerDeviceName ?? "Partner Device");
+                                PairingAccepted?.Invoke();
+                            }
+                            // Handle Auto-Connect resolution
+                            else if (isAutoConnecting && !IsConnected && status == "connected")
+                            {
+                                IsConnected = true;
+                                IsPartnerOnline = true;
+                                _lastTimePartnerSeenUpdated = Environment.TickCount64;
+                                isAutoConnecting = false;
+                                AutoConnected?.Invoke(CurrentRoomCode);
+                            }
+
+                            // If connected: sync charm & live presence
+                            if (IsConnected && status == "connected")
+                            {
+                                long currentTick = Environment.TickCount64;
+
+                                // Check if partner heartbeat was updated in Firebase
+                                if (partnerLastSeen > 0 && partnerLastSeen != _previousPartnerLastSeen)
+                                {
+                                    _previousPartnerLastSeen = partnerLastSeen;
+                                    _lastTimePartnerSeenUpdated = currentTick;
+                                }
+
+                                // Partner is online if we connected and heartbeat updated within last 10 seconds
+                                bool partnerOnline = (_lastTimePartnerSeenUpdated > 0 && (currentTick - _lastTimePartnerSeenUpdated) <= 10000);
+                                if (partnerOnline != IsPartnerOnline)
+                                {
+                                    IsPartnerOnline = partnerOnline;
+                                    PartnerPresenceChanged?.Invoke(partnerOnline);
+                                }
+
+                                if (!string.IsNullOrEmpty(charm) && charm != _lastCharm)
+                                {
+                                    _lastCharm = charm;
+                                    CharmChangedFromPartner?.Invoke(charm);
+                                }
+                            }
+                            else if (status == "declined")
+                            {
+                                IsConnected = false;
+                                IsPartnerOnline = false;
+                                ClearSavedPairedRoom();
+                                PairingDeclined?.Invoke();
+                                StopPolling();
+                                break;
+                            }
+                            else if (status == "unpaired")
+                            {
+                                IsConnected = false;
+                                IsPartnerOnline = false;
+                                ClearSavedPairedRoom();
+                                StopPolling();
+                                CurrentRoomCode = null;
+                                PartnerDeviceName = null;
+                                Unpaired?.Invoke();
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch (TaskCanceledException) { break; }
+                catch { }
+
+                try
+                {
+                    await Task.Delay(1000, token);
+                }
+                catch
+                {
+                    break;
+                }
+            }
+        }, token);
+    }
 }
