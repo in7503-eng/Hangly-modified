@@ -211,6 +211,12 @@
     <None Include="$(SubjectModelFile)" Link="Models/subject.onnx" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Update="Assets\Charms\Bubu Dudu\Glossy Bear Sunglasses Coffee Charm.svg">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
   <!--
     The DirectML package also carries its debug layer, its symbols and an import library.
     None of them run in the app — the debug layer is only loaded by developer tooling — and

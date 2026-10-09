@@ -39,6 +39,7 @@ public static partial class CharmCatalog
         new("gameOfThrones", "Game of Thrones"),
         new("airJordan", "Air Jordan"),
         new("pokemon", "Pokémon"),
+        new("bubuDudu", "Bubu Dudu"),
     ];
 
     /// <summary>The collections the Library offers as cards, in catalogue order.</summary>
@@ -66,11 +67,30 @@ public static partial class CharmCatalog
         new("gameOfThrones", "Game of Thrones", "The great houses of Westeros and the throne they fight for."),
         new("airJordan", "Air Jordan", "The sneakers that made the Jumpman an icon."),
         new("pokemon", "Pokémon", "The first partners, a few legends, and the ball that catches them."),
+        new("bubuDudu", "Bubu Dudu", "Adorable and charming Bubu & Dudu collectible ornaments."),
     ];
 
     /// <summary>Every built-in charm, in the order the charm menu offers them.</summary>
     public static IReadOnlyList<CharmCatalogEntry> All { get; } =
     [
+        new(
+            Id: "bubuCoffeeBear",
+            DisplayName: "Bubu Coffee Bear",
+            FileName: "Bubu Dudu/Glossy Bear Coffee Charm.svg", // Ensure folder name is "Bubu Dudu"
+            Mass: 3.20,
+            RadiusRatio: 0.165,
+            Palette: new CharmPalette(
+                new CharmColor(0.85, 0.55, 0.35),
+                new CharmColor(0.55, 0.30, 0.15),
+                new CharmColor(0.20, 0.08, 0.04),
+                new CharmColor(1.00, 0.90, 0.80)),
+            BeadCount: 0,
+            BodyRun: 0,
+            CategoryId: "bubuDudu",
+            Region: "Bubu Dudu",
+            Description: "Bubu wearing cool sunglasses and holding coffee, finished with a 3D glossy shine.",
+            Tags: ["bubu", "dudu", "bear", "coffee", "cute", "glossy"],
+            Sound: Audio.CharmSound.Glass),
         new(
             Id: "nazar",
             DisplayName: "Nazar boncuğu",

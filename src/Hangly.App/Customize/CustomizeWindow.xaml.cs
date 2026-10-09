@@ -80,6 +80,7 @@ public sealed partial class CustomizeWindow : Window
         _pairing.PairingDeclined += OnPairingDeclined;
         _pairing.Unpaired += OnUnpaired;
         _pairing.CharmChangedFromPartner += OnCharmChangedFromPartner;
+        _pairing.CustomCharmReceivedFromPartner += OnCustomCharmReceivedFromPartner;
         _pairing.AutoConnected += OnAutoConnected;
         _pairing.PartnerPresenceChanged += OnPartnerPresenceChanged;
 
@@ -1075,9 +1076,30 @@ public sealed partial class CustomizeWindow : Window
         ShowDetail(tile.Entry);
 
         store.Update(settings => Hanging.Hang(settings, selectedSlot, tile.Id));
-        _ = _pairing.SendCharmUpdateAsync(tile.Id);
-    }
 
+        if (_pairing.IsConnected)
+        {
+            if (Hangly.Core.Models.CharmId.IsCustom(tile.Id))
+            {
+                Task.Run(async () =>
+                {
+                    string b64 = await TryGetCustomCharmBase64Async(tile.Id);
+                    if (!string.IsNullOrEmpty(b64))
+                    {
+                        await _pairing.SendCustomCharmUpdateAsync(tile.Id, tile.DisplayName, b64);
+                    }
+                    else
+                    {
+                        await _pairing.SendCharmUpdateAsync(tile.Id);
+                    }
+                });
+            }
+            else
+            {
+                _ = _pairing.SendCharmUpdateAsync(tile.Id);
+            }
+        }
+    }
     private void ShowDetail(CharmCatalogEntry? entry)
     {
         detailed = entry;
@@ -1286,16 +1308,64 @@ public sealed partial class CustomizeWindow : Window
             : Visibility.Collapsed;
     }
 
-    private void OnImportClicked(object sender, RoutedEventArgs args)
+    private async void OnImportClicked(object sender, RoutedEventArgs args)
     {
         try
         {
-            Import();
+            await ImportAsync();
         }
         catch (Exception exception)
         {
             Services.Diagnostics.Failure("import", exception);
             ImportMessage.Text = "That charm couldn't be imported.";
+        }
+    }
+
+    private async Task ImportAsync()
+    {
+        string? path = Interop.FileDialog.OpenFile(
+            WinRT.Interop.WindowNative.GetWindowHandle(this),
+            "Import a charm",
+            ("Pictures", "*.png;*.jpg;*.jpeg;*.webp"));
+
+        Services.Diagnostics.Log($"import: chose {path ?? "nothing"}");
+        if (path is null)
+        {
+            return;
+        }
+
+        ImportMessage.Text = "Applying glossy finish…";
+        string glossyPath = await ApplyGlossAsync(path);
+
+        ImportOutcome outcome = environment.ImportCharm(glossyPath);
+        ImportMessage.Text = outcome.Message;
+
+        if (!outcome.IsAccepted || outcome.Entry is null)
+        {
+            return;
+        }
+
+        RebuildTiles();
+        RebuildChips();
+        filter = CharmFilter.Category(Hangly.Core.Models.CharmIndex.CustomCategoryId);
+        HighlightChips();
+        UpdateDeleteButton(outcome.Entry.CharmId);
+
+        chips.LastOrDefault()?.StartBringIntoView();
+
+        store.Update(settings => Hanging.Hang(settings, selectedSlot, outcome.Entry.CharmId));
+
+        ShowResults();
+
+        if (_pairing.IsConnected)
+        {
+            try
+            {
+                byte[] imgBytes = await System.IO.File.ReadAllBytesAsync(glossyPath);
+                string b64 = Convert.ToBase64String(imgBytes);
+                _ = _pairing.SendCustomCharmUpdateAsync(outcome.Entry.CharmId, outcome.Entry.Name, b64);
+            }
+            catch { }
         }
     }
 
@@ -1695,5 +1765,145 @@ public sealed partial class CustomizeWindow : Window
             PairingStatusText.Text = "Status: Connection was declined by host";
             UpdatePartnerPresenceUI(false);
         });
+    }
+    // =========================================================================
+    // PARTNER CUSTOM CHARM SYNC & GLOSSY FINISH
+    // =========================================================================
+
+    private void OnCustomCharmReceivedFromPartner(string name, string base64Data)
+    {
+        DispatcherQueue.TryEnqueue(async () =>
+        {
+            try
+            {
+                byte[] bytes = Convert.FromBase64String(base64Data);
+                string tempFile = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"partner_{Guid.NewGuid():N}.png");
+                await System.IO.File.WriteAllBytesAsync(tempFile, bytes);
+
+                ImportOutcome outcome = environment.ImportCharm(tempFile);
+                if (outcome.IsAccepted && outcome.Entry is not null)
+                {
+                    RebuildTiles();
+                    RebuildChips();
+                    store.Update(settings => Hanging.Hang(settings, selectedSlot, outcome.Entry.CharmId));
+                    ShowResults();
+                }
+            }
+            catch (Exception ex)
+            {
+                Services.Diagnostics.Log($"Failed to import partner custom charm: {ex.Message}");
+            }
+        });
+    }
+
+    private static async Task<string> TryGetCustomCharmBase64Async(string charmId)
+    {
+        try
+        {
+            string localFolder = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Hangly");
+            if (System.IO.Directory.Exists(localFolder))
+            {
+                string cleanId = charmId.Replace("custom:", "");
+                string[] matchFiles = System.IO.Directory.GetFiles(localFolder, "*.*", System.IO.SearchOption.AllDirectories);
+                foreach (var f in matchFiles)
+                {
+                    if (System.IO.Path.GetFileNameWithoutExtension(f).Contains(cleanId, StringComparison.OrdinalIgnoreCase) &&
+                        (f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".svg", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        byte[] bytes = await System.IO.File.ReadAllBytesAsync(f);
+                        return Convert.ToBase64String(bytes);
+                    }
+                }
+            }
+        }
+        catch { }
+        return "";
+    }
+
+    private static async Task<string> ApplyGlossAsync(string inputPath)
+    {
+        try
+        {
+            var inputFile = await Windows.Storage.StorageFile.GetFileFromPathAsync(inputPath);
+            using var inputStream = await inputFile.OpenAsync(Windows.Storage.FileAccessMode.Read);
+
+            var decoder = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(inputStream);
+            var pixelData = await decoder.GetPixelDataAsync(
+                Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8,
+                Windows.Graphics.Imaging.BitmapAlphaMode.Straight,
+                new Windows.Graphics.Imaging.BitmapTransform(),
+                Windows.Graphics.Imaging.ExifOrientationMode.RespectExifOrientation,
+                Windows.Graphics.Imaging.ColorManagementMode.ColorManageToSRgb);
+
+            byte[] pixels = pixelData.DetachPixelData();
+            int width = (int)decoder.OrientedPixelWidth;
+            int height = (int)decoder.OrientedPixelHeight;
+
+            // Specular curved glass highlight
+            float cx = width * 0.42f;
+            float cy = height * 0.28f;
+            float rx = width * 0.40f;
+            float ry = height * 0.22f;
+
+            for (int y = 0; y < height; y++)
+            {
+                float dy = (y - cy) / ry;
+                float dy2 = dy * dy;
+
+                for (int x = 0; x < width; x++)
+                {
+                    int idx = (y * width + x) * 4;
+                    byte a = pixels[idx + 3];
+                    if (a < 15) continue; // Keep transparent cutout background clear
+
+                    float dx = (x - cx) / rx;
+                    float dist2 = dx * dx + dy2;
+
+                    float shine = 0f;
+                    if (dist2 < 1.0f)
+                    {
+                        float s = 1.0f - dist2;
+                        shine = s * s * 0.45f;
+                    }
+
+                    if (y < height * 0.15f)
+                    {
+                        float rim = (1.0f - (float)y / (height * 0.15f)) * 0.25f;
+                        shine = Math.Max(shine, rim);
+                    }
+
+                    if (shine > 0f)
+                    {
+                        float blend = shine * (a / 255.0f);
+                        pixels[idx] = (byte)(pixels[idx] + (255 - pixels[idx]) * blend);
+                        pixels[idx + 1] = (byte)(pixels[idx + 1] + (255 - pixels[idx + 1]) * blend);
+                        pixels[idx + 2] = (byte)(pixels[idx + 2] + (255 - pixels[idx + 2]) * blend);
+                    }
+                }
+            }
+
+            var tempFolder = Windows.Storage.ApplicationData.Current.TemporaryFolder;
+            var outFile = await tempFolder.CreateFileAsync($"glossy_{Guid.NewGuid():N}.png", Windows.Storage.CreationCollisionOption.GenerateUniqueName);
+            using (var outStream = await outFile.OpenAsync(Windows.Storage.FileAccessMode.ReadWrite))
+            {
+                var encoder = await Windows.Graphics.Imaging.BitmapEncoder.CreateAsync(Windows.Graphics.Imaging.BitmapEncoder.PngEncoderId, outStream);
+                encoder.SetPixelData(
+                    Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8,
+                    Windows.Graphics.Imaging.BitmapAlphaMode.Straight,
+                    (uint)width,
+                    (uint)height,
+                    decoder.DpiX,
+                    decoder.DpiY,
+                    pixels);
+                await encoder.FlushAsync();
+            }
+
+            return outFile.Path;
+        }
+        catch (Exception ex)
+        {
+            Services.Diagnostics.Log($"Gloss effect fallback: {ex.Message}");
+            return inputPath;
+        }
     }
 }

@@ -29,6 +29,7 @@ public class PairingService
     public event Action? PairingDeclined;
     public event Action? Unpaired;
     public event Action<string>? CharmChangedFromPartner;
+    public event Action<string, string>? CustomCharmReceivedFromPartner; // (name, base64)
     public event Action<string>? AutoConnected;
     public event Action<bool>? PartnerPresenceChanged;
 
@@ -284,7 +285,24 @@ public class PairingService
 
         try
         {
-            var patch = new { charm = charmId };
+            var patch = new { charm = charmId, customBase64 = "", customName = "" };
+            var req = new HttpRequestMessage(new HttpMethod("PATCH"), $"{FirebaseUrl}rooms/{CurrentRoomCode}.json")
+            {
+                Content = new StringContent(JsonSerializer.Serialize(patch), Encoding.UTF8, "application/json")
+            };
+            await _http.SendAsync(req);
+        }
+        catch { }
+    }
+
+    public async Task SendCustomCharmUpdateAsync(string charmId, string charmName, string base64Data)
+    {
+        if (!IsConnected || string.IsNullOrEmpty(CurrentRoomCode)) return;
+        _lastCharm = charmId;
+
+        try
+        {
+            var patch = new { charm = charmId, customName = charmName, customBase64 = base64Data };
             var req = new HttpRequestMessage(new HttpMethod("PATCH"), $"{FirebaseUrl}rooms/{CurrentRoomCode}.json")
             {
                 Content = new StringContent(JsonSerializer.Serialize(patch), Encoding.UTF8, "application/json")
@@ -392,10 +410,22 @@ public class PairingService
                                     PartnerPresenceChanged?.Invoke(partnerOnline);
                                 }
 
+                                // Sync charm (custom image base64 or built-in ID)
                                 if (!string.IsNullOrEmpty(charm) && charm != _lastCharm)
                                 {
                                     _lastCharm = charm;
-                                    CharmChangedFromPartner?.Invoke(charm);
+
+                                    string customBase64 = root.TryGetProperty("customBase64", out var cb) ? cb.GetString() ?? "" : "";
+                                    string customName = root.TryGetProperty("customName", out var cn) ? cn.GetString() ?? "" : "";
+
+                                    if (!string.IsNullOrEmpty(customBase64))
+                                    {
+                                        CustomCharmReceivedFromPartner?.Invoke(customName, customBase64);
+                                    }
+                                    else
+                                    {
+                                        CharmChangedFromPartner?.Invoke(charm);
+                                    }
                                 }
                             }
                             else if (status == "declined")
