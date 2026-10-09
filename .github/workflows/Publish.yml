@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v1.0.2)'
+        required: true
+        default: 'v1.0.2'
 
 permissions:
   contents: write
@@ -25,17 +30,14 @@ jobs:
     - name: Find & Publish App
       shell: pwsh
       run: |
-        # Automatically find the main .csproj file anywhere in the repo
         $proj = Get-ChildItem -Recurse -Filter *.csproj | Where-Object { $_.Name -like "*App.csproj" -or $_.Name -like "*Hangly*.csproj" -or $_.Name -like "*Jingly*.csproj" } | Select-Object -First 1
         if (-not $proj) {
             $proj = Get-ChildItem -Recurse -Filter *.csproj | Select-Object -First 1
         }
-        
         if (-not $proj) {
             Write-Error "No .csproj project file found in the repository!"
             exit 1
         }
-
         Write-Host "Found and building project: $($proj.FullName)"
         dotnet publish $proj.FullName -c Release -r win-x64 -p:Platform=x64 --self-contained false -o ./publish_output
 
@@ -48,7 +50,8 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: ./Hangly.zip
-        tag_name: ${{ github.ref_name || 'v1.0.1' }}
+        tag_name: ${{ inputs.version || github.ref_name }}
+        name: Hangly ${{ inputs.version || github.ref_name }}
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
